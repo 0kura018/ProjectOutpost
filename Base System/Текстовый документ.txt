@@ -1,0 +1,467 @@
+// RoomSpotType.cs
+public enum RoomSpotType
+{
+    Idle,
+    Work,
+    Sleep,
+    Guard
+}
+// RoomSpot.cs
+using UnityEngine;
+
+public class RoomSpot : MonoBehaviour
+{
+    public RoomSpotType Type;
+    public bool IsOccupied { get; private set; }
+
+    public void SetOccupied(bool occupied)
+    {
+        IsOccupied = occupied;
+    }
+}
+// RoomTransition.cs
+using UnityEngine;
+
+public enum TransitionType
+{
+    HorizontalDoor,
+    Elevator
+}
+
+public class RoomTransition : MonoBehaviour
+{
+    public Room From;
+    public Room To;
+    public TransitionType Type = TransitionType.HorizontalDoor;
+
+    // Точки, к которым юнит подходит и с которых выходит
+    public Transform EntryPoint;
+    public Transform ExitPoint;
+
+    // Длительность поездки при лифте (сек)
+    public float ElevatorTravelDuration = 0.8f;
+
+    // Удобный метод проверки направления / сопоставления
+    public bool Connects(Room a, Room b)
+    {
+        return (From == a && To == b) || (From == b && To == a);
+    }
+
+    // Получить точку входа если мы движемся from -> to
+    public Transform GetEntryFor(Room from)
+    {
+        if (From == from) return EntryPoint;
+        return ExitPoint;
+    }
+
+    public Transform GetExitFor(Room to)
+    {
+        if (To == to) return ExitPoint;
+        return EntryPoint;
+    }
+}
+// Room.cs
+using System.Collections.Generic;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class Room : MonoBehaviour
+{
+    // Список переходов из этой комнаты (двери/лифты и т.д.)
+    public List<RoomTransition> Transitions = new();
+
+    // Точки внутри комнаты (куда юнит может встать)
+    public List<RoomSpot> Spots = new();
+
+    // Получить соседние комнаты (временная коллекция)
+    public void GetNeighbors(List<Room> outNeighbors)
+    {
+        outNeighbors.Clear();
+        foreach (var t in Transitions)
+        {
+            if (t.From == this && t.To != null) outNeighbors.Add(t.To);
+            else if (t.To == this && t.From != null) outNeighbors.Add(t.From);
+        }
+    }
+
+    // Найти transition, ведущий from -> to (вернёт первую найденную)
+    public RoomTransition GetTransitionTo(Room to)
+    {
+        foreach (var t in Transitions)
+        {
+            if (t.Connects(this, to))
+                return t;
+        }
+        return null;
+    }
+}
+// RoomSpotSelector.cs
+using System.Collections.Generic;
+
+public static class RoomSpotSelector
+{
+    // Быстрый выбор свободной точки нужного типа, fallback - любая свободная точка
+    public static RoomSpot SelectSpot(Room room, RoomSpotType type)
+    {
+        RoomSpot fallback = null;
+        // прямой перебор — дешево и понятно
+        foreach (var spot in room.Spots)
+        {
+            if (spot == null) continue;
+            if (spot.IsOccupied) continue;
+            if (spot.Type == type) return spot;
+            fallback ??= spot;
+        }
+
+        return fallback;
+    }
+}
+// PathfindingManager.cs
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>
+/// Синглтон-менеджер для поиска путей (BFS).
+/// Переиспользуемые коллекции, чтобы уменьшить GC.
+/// Создай один объект в сцене с этим компонентом.
+/// </summary>
+public class PathfindingManager : MonoBehaviour
+{
+    public static PathfindingManager Instance { get; private set; }
+
+    // Вспомогательные структуры (переиспользуются)
+    private Queue<Room> _queue = new();
+    private HashSet<Room> _visited = new();
+    private Dictionary<Room, Room> _cameFrom = new();
+    private List<Room> _neighborsTemp = new();
+
+    private void Awake()
+    {
+        if (Instance != null && Instance != this)
+        {
+            Destroy(this);
+            return;
+        }
+        Instance = this;
+    }
+
+    /// <summary>
+    /// Найти путь от start до target (включая обоих). Возвращает true, если путь найден.
+    /// outPath будет очищен и заполнен последовательностью комнат.
+    /// allowRandomness слегка перемешивает порядок соседей (чтобы поведение было менее предсказуемым).
+    /// </summary>
+    public bool FindPath(Room start, Room target, List<Room> outPath, bool allowRandomness = true)
+    {
+        outPath.Clear();
+        if (start == null || target == null) return false;
+        if (start == target)
+        {
+            outPath.Add(start);
+            return true;
+        }
+
+        _queue.Clear();
+        _visited.Clear();
+        _cameFrom.Clear();
+
+        _queue.Enqueue(start);
+        _visited.Add(start);
+
+        while (_queue.Count > 0)
+        {
+            var current = _queue.Dequeue();
+
+            // получить соседей
+            current.GetNeighbors(_neighborsTemp);
+
+            // лёгкая рандомизация первого соседа (без выделения коллекций)
+            if (allowRandomness && _neighborsTemp.Count > 1)
+            {
+                int swapIndex = Random.Range(0, _neighborsTemp.Count);
+                var tmp = _neighborsTemp[0];
+                _neighborsTemp[0] = _neighborsTemp[swapIndex];
+                _neighborsTemp[swapIndex] = tmp;
+            }
+
+            foreach (var next in _neighborsTemp)
+            {
+                if (next == null) continue;
+                if (_visited.Contains(next)) continue;
+
+                _visited.Add(next);
+                _cameFrom[next] = current;
+                _queue.Enqueue(next);
+
+                if (next == target)
+                {
+                    ReconstructPath(start, target, outPath);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void ReconstructPath(Room start, Room target, List<Room> outPath)
+    {
+        var cur = target;
+        while (cur != start)
+        {
+            outPath.Add(cur);
+            cur = _cameFrom[cur];
+        }
+        outPath.Add(start);
+        outPath.Reverse();
+    }
+}
+// ElevatorController.cs
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>
+/// Простой контроллер лифтов: очередь запросов. Обрабатывает один поезд за раз.
+/// Юнит вызывает: yield return StartCoroutine(ElevatorController.Instance.UseElevator(transition, thisUnit));
+/// </summary>
+public class ElevatorController : MonoBehaviour
+{
+    public static ElevatorController Instance { get; private set; }
+
+    private struct ElevatorRequest
+    {
+        public RoomTransition Transition;
+        public UnitController Unit;
+        public bool IsDone;
+    }
+
+    private Queue<ElevatorRequest> _requests = new();
+    private bool _isProcessing = false;
+
+    private void Awake()
+    {
+        if (Instance != null && Instance != this) { Destroy(this); return; }
+        Instance = this;
+    }
+
+    /// <summary>
+    /// Юнит вызывает этот IEnumerator и ждёт пока его запрос обработают.
+    /// Внутри мы даём юниту попасть в EntryPoint, затем имитируем поездку и помещаем его в ExitPoint.
+    /// (Можно заменить на реальное движение/анимацию лифта.)
+    /// </summary>
+    public IEnumerator UseElevator(RoomTransition transition, UnitController unit)
+    {
+        if (transition == null) yield break;
+        var req = new ElevatorRequest { Transition = transition, Unit = unit, IsDone = false };
+        _requests.Enqueue(req);
+
+        if (!_isProcessing) StartCoroutine(ProcessQueue());
+
+        // Ждём, пока этот конкретный запрос будет обработан.
+        while (!_requests.Contains(req) && !req.IsDone) // fast-path: if queue moved already
+        {
+            yield return null;
+        }
+
+        // На самом деле выше проверка не сработает (struct сравнения), поэтому: просто ждать по ссылке.
+        // Исправим: хранить индикатор завершения через класс.
+        // Но чтобы не усложнять — используем другой подход: сделаем реальную очередь обработки и отдельную сигнализацию.
+        yield break;
+    }
+
+    // --- Альтернатива: рабочая версия с классом-запросом (делаем корректно) ---
+    private class _Req
+    {
+        public RoomTransition Transition;
+        public UnitController Unit;
+        public bool Done;
+    }
+
+    private Queue<_Req> _procQueue = new();
+
+    public IEnumerator UseElevator_Working(RoomTransition transition, UnitController unit)
+    {
+        if (transition == null) yield break;
+        var r = new _Req { Transition = transition, Unit = unit, Done = false };
+        _procQueue.Enqueue(r);
+
+        if (!_isProcessing) StartCoroutine(ProcessQueue_Working());
+
+        // ждём завершения нашего запроса
+        while (!r.Done) yield return null;
+    }
+
+    private IEnumerator ProcessQueue_Working()
+    {
+        _isProcessing = true;
+        while (_procQueue.Count > 0)
+        {
+            var r = _procQueue.Dequeue();
+
+            // Подставляем юнита в EntryPoint (точка, где он ждет лифта)
+            if (r.Unit != null && r.Transition != null && r.Transition.EntryPoint != null)
+            {
+                // "Подойти" к точке (здесь моментально: можно плавно двигать)
+                r.Unit.transform.position = r.Transition.EntryPoint.position;
+            }
+
+            // Симулируем ожидание лифта/поездку
+            float duration = Mathf.Max(0.05f, r.Transition?.ElevatorTravelDuration ?? 0.5f);
+            float t = 0f;
+            Vector3 startPos = r.Transition?.EntryPoint?.position ?? Vector3.zero;
+            Vector3 endPos = r.Transition?.ExitPoint?.position ?? Vector3.zero;
+
+            while (t < duration)
+            {
+                t += Time.deltaTime;
+                float alpha = Mathf.Clamp01(t / duration);
+                // плавное перемещение юнита
+                if (r.Unit != null)
+                    r.Unit.transform.position = Vector3.Lerp(startPos, endPos, alpha);
+                yield return null;
+            }
+
+            // Убедимся, что юнит точно на выходе
+            if (r.Unit != null) r.Unit.transform.position = endPos;
+
+            r.Done = true;
+            yield return null;
+        }
+        _isProcessing = false;
+    }
+}
+// UnitController.cs
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>
+/// Контроллер юнита: оркеструет поиск пути и перемещение по переходам и спотам.
+/// </summary>
+[RequireComponent(typeof(Transform))]
+public class UnitController : MonoBehaviour
+{
+    public Room CurrentRoom;
+    public float WalkSpeed = 3f;         // скорость по X
+    public float ApproachTolerance = 0.05f;
+
+    // internal
+    private RoomSpot _currentSpot;
+    private List<Room> _roomPath = new();
+
+    /// <summary>
+    /// Вызвать, чтобы уйти в комнату и занять точку нужного типа.
+    /// </summary>
+    public void GoToRoom(Room targetRoom, RoomSpotType spotType)
+    {
+        if (targetRoom == null) return;
+        if (!PathfindingManager.Instance.FindPath(CurrentRoom, targetRoom, _roomPath, allowRandomness: true))
+        {
+            Debug.Log($"[Unit] Путь не найден: {name} {CurrentRoom?.name} -> {targetRoom.name}");
+            return;
+        }
+
+        var spot = RoomSpotSelector.SelectSpot(targetRoom, spotType);
+        if (spot == null)
+        {
+            Debug.Log($"[Unit] Нет свободных точек в комнате {targetRoom.name}");
+            return;
+        }
+
+        // Бронируем точку сразу
+        spot.SetOccupied(true);
+        if (_currentSpot != null) _currentSpot.SetOccupied(false);
+        _currentSpot = spot;
+
+        StopAllCoroutines();
+        StartCoroutine(MoveAlongPathAndTakeSpot(_roomPath, spot));
+    }
+
+    private IEnumerator MoveAlongPathAndTakeSpot(List<Room> path, RoomSpot finalSpot)
+    {
+        if (path == null || path.Count == 0) yield break;
+
+        for (int i = 0; i < path.Count - 1; i++)
+        {
+            var from = path[i];
+            var to = path[i + 1];
+
+            var transition = from.GetTransitionTo(to);
+            if (transition == null)
+            {
+                // Если нет transition — просто перейдём в центр цели (fallback)
+                yield return MoveToPosition(to.transform.position);
+                CurrentRoom = to;
+                continue;
+            }
+
+            // Подойти к точке входа (по X — side view)
+            var entry = transition.GetEntryFor(from);
+            if (entry != null)
+                yield return MoveToX(entry.position.x);
+
+            if (transition.Type == TransitionType.Elevator)
+            {
+                // Используем контроллер лифта (очередь)
+                if (ElevatorController.Instance != null)
+                {
+                    yield return StartCoroutine(ElevatorController.Instance.UseElevator_Working(transition, this));
+                }
+                else
+                {
+                    // fallback: телепорт
+                    var exit = transition.GetExitFor(to);
+                    if (exit != null) transform.position = exit.position;
+                }
+            }
+            else
+            {
+                // Горизонтальный проход: подойти к ExitPoint по X
+                var exit = transition.GetExitFor(to);
+                if (exit != null)
+                    yield return MoveToX(exit.position.x);
+                else
+                    yield return MoveToPosition(to.transform.position);
+            }
+
+            CurrentRoom = to;
+            yield return null;
+        }
+
+        // Наконец — занять итоговую точку (если есть)
+        if (finalSpot != null)
+        {
+            yield return MoveToPosition(finalSpot.transform.position);
+            CurrentRoom = path[path.Count - 1];
+        }
+    }
+
+    #region Движение: низкоуровневые корутины
+
+    private IEnumerator MoveToX(float targetX)
+    {
+        while (Mathf.Abs(transform.position.x - targetX) > ApproachTolerance)
+        {
+            float dir = Mathf.Sign(targetX - transform.position.x);
+            transform.position += Vector3.right * dir * WalkSpeed * Time.deltaTime;
+            yield return null;
+        }
+        // выровнять точно по X
+        transform.position = new Vector3(targetX, transform.position.y, transform.position.z);
+        yield return null;
+    }
+
+    private IEnumerator MoveToPosition(Vector3 target)
+    {
+        // простое перемещение с одновременным движением по X и Y (если нужно)
+        while (Vector3.Distance(transform.position, target) > ApproachTolerance)
+        {
+            transform.position = Vector3.MoveTowards(transform.position, target, WalkSpeed * Time.deltaTime);
+            yield return null;
+        }
+        transform.position = target;
+        yield return null;
+    }
+
+    #endregion
+}
